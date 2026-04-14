@@ -1,0 +1,100 @@
+:root {
+  --text: #5f5f5f;
+  --text-h: #1a1a1a;
+  --bg: transparent;
+  --border: rgba(0, 0, 0, 0.1);
+  --code-bg: rgba(0, 103, 192, 0.08);
+  --accent: #0067c0;
+  --accent-bg: rgba(0, 103, 192, 0.12);
+  --accent-border: rgba(0, 103, 192, 0.3);
+  --social-bg: rgba(255, 255, 255, 0.6);
+  --shadow: 0 8px 16px #0000001A;
+
+  --sans: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --heading: system-ui, 'Segoe UI', Roboto, sans-serif;
+  --mono: ui-monospace, Consolas, monospace;
+
+  font: 18px/145% var(--sans);
+  letter-spacing: 0.18px;
+  color-scheme: light dark;
+  color: var(--text);
+  background: transparent;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+
+  @media (max-width: 1024px) {
+    font-size: 16px;
+  }
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --text: #d0d0d0;
+    --text-h: #ffffff;
+    --bg: transparent;
+    --border: rgba(255, 255, 255, 0.1);
+    --code-bg: rgba(96, 205, 255, 0.14);
+    --accent: #60cdff;
+    --accent-bg: rgba(96, 205, 255, 0.16);
+    --accent-border: rgba(96, 205, 255, 0.34);
+    --social-bg: rgba(45, 45, 45, 0.5);
+    --shadow: 0 8px 16px #00000059;
+  }
+
+  #social .button-icon {
+    filter: invert(1) brightness(2);
+  }
+}
+
+#root {
+  width: 1126px;
+  max-width: 100%;
+  margin: 0 auto;
+  text-align: center;
+  border-inline: 1px solid var(--border);
+  min-height: 100svh;
+  display: flex;
+  flex-direction: column;
+  box-sizing: border-box;
+  background: transparent;
+  backdrop-filter: blur(10px);
+}
+
+body {
+  margin: 0;
+}
+
+h1,
+h2 {
+  font-family: var(--heading);
+  font-weight: 500;
+  color: var(--text-h);
+}
+
+h1 {
+  font-size: 56px;
+  letter-spacing: -1.68px;
+  margin: 32px 0;
+  @media (max-width: 1024px) {
+    font-size: 36px;
+    margin: 20px 0;
+  }
+}
+h2 {
+  font-size: 24px;
+  line-height: 118%;
+  letter-spacing: -0.24px;
+  margin: 0 0 8px;
+  @media (max-width: 1024px) {
+    font-size: 20px;
+  }
+}
+p {
+  margin: 0;
+}
+
+code, kbd, samp, pre {
+  font-family: var(--mono);
+}
