@@ -5,7 +5,7 @@
   "publisher": "Skydimo",
   "type": "extension",
   "language": "native-c",
-  "abi": "skydimo-extension-c-v1",
+  "abi": "skydimo-extension-c-v2",
   "entry": {
     "windows-x86_64": "native/windows-x86_64/automatic.dll"
   },

@@ -13,7 +13,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 use serde_json::{json, Map, Value};
 
-const SKYDIMO_NATIVE_C_ABI_VERSION: u32 = 1;
+const SKYDIMO_NATIVE_C_ABI_VERSION: u32 = 2;
 const SKYDIMO_PLUGIN_KIND_EXTENSION: u32 = 1 << 2;
 
 const SKYDIMO_LOG_INFO: u32 = 2;
@@ -87,6 +87,13 @@ pub struct SkydimoOutputFrameV1 {
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
+pub struct SkydimoLedColorV1 {
+    pub index: usize,
+    pub color: SkydimoRgb,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
 pub struct SkydimoDeviceInfoV1 {
     pub manufacturer: SkydimoStr,
     pub model: SkydimoStr,
@@ -151,6 +158,41 @@ pub struct SkydimoHostApiV1 {
         Option<unsafe extern "C" fn(*mut c_void, *const u8, usize) -> isize>,
     pub controller_hid_get_feature_report:
         Option<unsafe extern "C" fn(*mut c_void, *mut u8, usize, u8) -> isize>,
+    pub extension_lock_leds: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const c_char,
+            usize,
+            *const c_char,
+            usize,
+            *const usize,
+            usize,
+            *mut usize,
+            *mut usize,
+        ) -> i32,
+    >,
+    pub extension_unlock_leds: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const c_char,
+            usize,
+            *const c_char,
+            usize,
+            *const usize,
+            usize,
+        ) -> i32,
+    >,
+    pub extension_set_leds_rgb: Option<
+        unsafe extern "C" fn(
+            *mut c_void,
+            *const c_char,
+            usize,
+            *const c_char,
+            usize,
+            *const SkydimoLedColorV1,
+            usize,
+        ) -> i32,
+    >,
 }
 
 #[repr(C)]
