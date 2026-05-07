@@ -4,10 +4,13 @@
   "name": "meta.name",
   "publisher": "Skydimo",
   "type": "extension",
-  "language": "lua",
-  "entry": "init.lua",
+  "language": "native-c",
+  "abi": "skydimo-extension-c-v1",
+  "entry": {
+    "windows-x86_64": "native/windows-x86_64/automatic.dll"
+  },
   "page": "page/dist/index.html",
-  "permissions": ["system:process", "system:window-focus"],
+  "permissions": [],
   "description": "meta.description",
   "repository": "https://github.com/skydimo/skydimo-plugins",
   "license": "MIT"
