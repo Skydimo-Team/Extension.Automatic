@@ -502,6 +502,7 @@ struct AutomaticExtension {
     state: Arc<Mutex<RuntimeState>>,
     stop_monitor: Arc<AtomicBool>,
     monitor_thread: Option<thread::JoinHandle<()>>,
+    started: bool,
 }
 
 impl AutomaticExtension {
@@ -511,10 +512,14 @@ impl AutomaticExtension {
             state: Arc::new(Mutex::new(RuntimeState::new())),
             stop_monitor: Arc::new(AtomicBool::new(false)),
             monitor_thread: None,
+            started: false,
         }
     }
 
     fn start(&mut self) -> Result<(), String> {
+        if self.started {
+            self.stop();
+        }
         self.stop_monitor.store(false, Ordering::SeqCst);
         let data_dir = self
             .host
@@ -569,11 +574,16 @@ impl AutomaticExtension {
                 .spawn(move || monitor_loop(host, state, stop))
                 .map_err(|err| err.to_string())?,
         );
+        self.started = true;
 
         Ok(())
     }
 
     fn stop(&mut self) {
+        if !self.started && self.monitor_thread.is_none() {
+            return;
+        }
+        self.started = false;
         self.stop_monitor.store(true, Ordering::SeqCst);
         if let Some(handle) = self.monitor_thread.take() {
             let _ = handle.join();

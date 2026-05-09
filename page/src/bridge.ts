@@ -168,6 +168,7 @@ class ExtensionBridge {
   private statusListeners = new Set<StatusListener>()
   private rpcId = 1
   private status: BridgeStatus = 'disconnected'
+  private shouldReconnect = false
 
   subscribe(listener: BridgeListener) {
     this.listeners.add(listener)
@@ -181,19 +182,27 @@ class ExtensionBridge {
   }
 
   connect() {
+    this.shouldReconnect = true
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer)
+      this.reconnectTimer = null
+    }
     if (this.ws && (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)) {
       return
     }
 
     this.setStatus('connecting')
-    this.ws = new WebSocket(PAGE.wsUrl)
+    const socket = new WebSocket(PAGE.wsUrl)
+    this.ws = socket
 
-    this.ws.onopen = () => {
+    socket.onopen = () => {
+      if (this.ws !== socket) return
       this.setStatus('connected')
       this.send('bootstrap')
     }
 
-    this.ws.onmessage = (event) => {
+    socket.onmessage = (event) => {
+      if (this.ws !== socket) return
       let payload: Record<string, unknown>
       try {
         payload = JSON.parse(event.data) as Record<string, unknown>
@@ -258,14 +267,21 @@ class ExtensionBridge {
       }
     }
 
-    this.ws.onclose = () => {
+    socket.onclose = () => {
+      if (this.ws !== socket) return
       this.ws = null
       this.setStatus('disconnected')
-      this.reconnectTimer = setTimeout(() => this.connect(), 3000)
+      if (this.shouldReconnect && !this.reconnectTimer) {
+        this.reconnectTimer = setTimeout(() => {
+          this.reconnectTimer = null
+          this.connect()
+        }, 3000)
+      }
     }
   }
 
   disconnect() {
+    this.shouldReconnect = false
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer)
       this.reconnectTimer = null
