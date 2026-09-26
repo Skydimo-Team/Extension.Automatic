@@ -147,15 +147,18 @@ export interface ScopeAction {
 }
 
 export interface ConditionLeaf {
-  kind: 'app_running' | 'app_foreground' | 'window_title_contains'
-  app_name?: string
-  value?: string
+  kind: 'app_running' | 'app_foreground' | 'window_title_contains' | 'media_playing' | 'media_source_app'
+  app_name?: unknown
+  value?: unknown
+  source_app_id?: unknown
+  [key: string]: unknown
 }
 
 export interface ConditionGroup {
   logic: 'and' | 'or'
   negated: boolean
-  items: Array<ConditionGroup | ConditionLeaf>
+  // Preserve opaque/invalid JSON conditions; only explicit user removal may drop one.
+  items: unknown[]
 }
 
 export interface RuleConfig {
@@ -340,9 +343,13 @@ export function getEffectDefaults(effect?: EffectInfo) {
 }
 
 export function isConditionGroup(
-  item: ConditionGroup | ConditionLeaf,
+  item: unknown,
 ): item is ConditionGroup {
-  return 'items' in item
+  if (!item || typeof item !== 'object' || Array.isArray(item)) return false
+  const value = item as Record<string, unknown>
+  return !('kind' in value) && !('type' in value) && Array.isArray(value.items)
+    && (value.logic === undefined || value.logic === 'and' || value.logic === 'or')
+    && (value.negated === undefined || typeof value.negated === 'boolean')
 }
 
 export function checkDependency(

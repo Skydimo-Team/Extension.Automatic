@@ -8,10 +8,17 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use serde_json::{json, Map, Value};
+
+mod media;
+
+#[cfg(test)]
+mod media_tests;
+#[cfg(test)]
+mod condition_tests;
 
 const SKYDIMO_NATIVE_C_ABI_VERSION: u32 = 2;
 const SKYDIMO_PLUGIN_KIND_EXTENSION: u32 = 1 << 2;
@@ -443,6 +450,7 @@ struct RuntimeState {
     process: ProcessSnapshot,
     focus: FocusSnapshot,
     scheduler: Value,
+    media: media::MediaSnapshot,
     activity: Vec<Value>,
     activity_counter: u64,
     current_plan_key: Option<String>,
@@ -460,6 +468,7 @@ impl RuntimeState {
             process: ProcessSnapshot::default(),
             focus: FocusSnapshot::default(),
             scheduler: empty_scheduler_state(),
+            media: media::MediaSnapshot::default(),
             activity: Vec::new(),
             activity_counter: 0,
             current_plan_key: None,
@@ -493,6 +502,7 @@ impl RuntimeState {
         json!({
             "process": self.process,
             "focus": self.focus,
+            "media": self.media,
         })
     }
 }
@@ -529,6 +539,9 @@ impl AutomaticExtension {
             .ok_or_else(|| "host returned non-string data_dir".to_string())?;
 
         let initial_monitor = monitor::collect_snapshot();
+        let initial_media = media::MediaSnapshot::read_with(cfg!(windows), |method, request| {
+            self.host.call_json(method, request)
+        });
         {
             let mut state = self
                 .state
@@ -560,6 +573,7 @@ impl AutomaticExtension {
 
             state.process = initial_monitor.process;
             state.focus = initial_monitor.focus;
+            state.media = initial_media;
             emit_snapshot_locked(&self.host, &state);
             emit_system_state_locked(&self.host, &state);
             recompute_and_emit_locked(&self.host, &mut state, "bootstrap");
@@ -591,6 +605,19 @@ impl AutomaticExtension {
     }
 
     fn handle_event(&mut self, event: &str, data: Value) -> Result<(), String> {
+        if matches!(event, "system.media.changed" | "system.media.playback_changed") {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| "automatic state mutex poisoned".to_string())?;
+            // Events are invalidations, not authoritative snapshots: a queued
+            // old payload must not overwrite a newer reconciliation result.
+            if refresh_media_locked(&self.host, &mut state) {
+                emit_system_state_locked(&self.host, &state);
+                recompute_and_emit_locked(&self.host, &mut state, "media_changed");
+            }
+            return Ok(());
+        }
         if event != "devices-changed" {
             return Ok(());
         }
@@ -750,6 +777,7 @@ fn save_config_locked(host: &HostBridge, state: &mut RuntimeState, config: Value
 }
 
 fn monitor_loop(host: HostBridge, state: Arc<Mutex<RuntimeState>>, stop: Arc<AtomicBool>) {
+    let mut media_schedule = media::ReconcileSchedule::new(Instant::now());
     while !stop.load(Ordering::SeqCst) {
         sleep_interruptible(&stop, MONITOR_INTERVAL);
         if stop.load(Ordering::SeqCst) {
@@ -794,16 +822,39 @@ fn monitor_loop(host: HostBridge, state: Arc<Mutex<RuntimeState>>, stop: Arc<Ato
             focus_changed = true;
         }
 
-        if process_changed || focus_changed {
-            let reason = match (process_changed, focus_changed) {
-                (true, false) => "process_changed",
-                (false, true) => "focus_changed",
+        let media_changed = reconcile_media_locked(&host, &mut guard, &mut media_schedule, Instant::now());
+        if process_changed || focus_changed || media_changed {
+            let reason = match (process_changed, focus_changed, media_changed) {
+                (true, false, false) => "process_changed",
+                (false, true, false) => "focus_changed",
+                (false, false, true) => "media_changed",
                 _ => "monitor_changed",
             };
             emit_system_state_locked(&host, &guard);
             recompute_and_emit_locked(&host, &mut guard, reason);
         }
     }
+}
+
+fn reconcile_media_locked(
+    host: &HostBridge,
+    state: &mut RuntimeState,
+    schedule: &mut media::ReconcileSchedule,
+    now: Instant,
+) -> bool {
+    schedule.take_due(now) && refresh_media_locked(host, state)
+}
+
+fn refresh_media_locked(host: &HostBridge, state: &mut RuntimeState) -> bool {
+    // Core's getter reads cached session/art memory; max_edge=1 samples one
+    // pixel, with no WinRT/thumbnail I/O or audio capture. Serialize reads with
+    // event updates so neither can overwrite a more recently committed read.
+    let next = media::MediaSnapshot::read_with(cfg!(windows), |method, request| {
+        host.call_json(method, request)
+    });
+    if state.media == next { return false; }
+    state.media = next;
+    true
 }
 
 fn sleep_interruptible(stop: &AtomicBool, duration: Duration) {
@@ -1167,6 +1218,43 @@ fn action_signature(action: &Value) -> Value {
 }
 
 fn matches_group(group: &Value, snapshot: &Value) -> bool {
+    conditions_valid(group)
+        && media::conditions_available(group, snapshot)
+        && matches_available_group(group, snapshot)
+}
+
+fn is_condition_group(value: &Value) -> bool {
+    value.as_object().is_some_and(|object| {
+        !object.contains_key("kind") && !object.contains_key("type")
+            && object.get("items").is_some_and(Value::is_array)
+            && object.get("logic").is_none_or(|logic| matches!(logic.as_str(), Some("and" | "or")))
+            && object.get("negated").is_none_or(Value::is_boolean)
+    })
+}
+
+/// Invalid/unsupported leaves make the entire rule ineligible, before OR/NOT.
+/// Treating them as false locally would let negation accidentally activate a rule.
+fn conditions_valid(group: &Value) -> bool {
+    if !is_condition_group(group) {
+        return false;
+    }
+    group.get("items").and_then(Value::as_array).is_some_and(|items| {
+        items.iter().all(|condition| {
+            if is_condition_group(condition) {
+                return conditions_valid(condition);
+            }
+            match condition.get("kind").and_then(Value::as_str) {
+                Some("app_running" | "app_foreground") => normalize_condition_text(condition.get("app_name")).is_some(),
+                Some("window_title_contains") => normalize_condition_text(condition.get("value")).is_some(),
+                Some("media_playing") => true,
+                Some("media_source_app") => media::normalize_source_app_id(condition.get("source_app_id")).is_some(),
+                _ => false,
+            }
+        })
+    })
+}
+
+fn matches_available_group(group: &Value, snapshot: &Value) -> bool {
     let Some(group) = group.as_object() else {
         return false;
     };
@@ -1186,8 +1274,8 @@ fn matches_group(group: &Value, snapshot: &Value) -> bool {
     }
 
     for item in items {
-        let matched = if item.get("items").is_some() {
-            matches_group(&item, snapshot)
+        let matched = if is_condition_group(&item) {
+            matches_available_group(&item, snapshot)
         } else {
             matches_condition(&item, snapshot)
         };
@@ -1213,6 +1301,9 @@ fn matches_condition(condition: &Value, snapshot: &Value) -> bool {
         return false;
     };
     match kind {
+        "media_playing" | "media_source_app" => {
+            media::matches_condition(condition, snapshot).unwrap_or(false)
+        }
         "app_running" => {
             let Some(app_name) = condition.get("app_name").and_then(Value::as_str) else {
                 return false;
@@ -1435,9 +1526,14 @@ fn normalize_action(action: &Value) -> Option<Value> {
 }
 
 fn normalize_group(group: Option<&Value>) -> Value {
-    let Some(object) = group.and_then(Value::as_object) else {
+    let Some(group) = group else {
         return json!({ "logic": "and", "negated": false, "items": [] });
     };
+    if !is_condition_group(group) {
+        // Retain malformed roots as an opaque leaf, not an unconditional empty AND.
+        return json!({ "logic": "and", "negated": false, "items": [group] });
+    }
+    let object = group.as_object().expect("validated condition group");
     let logic = if object.get("logic").and_then(Value::as_str) == Some("or") {
         "or"
     } else {
@@ -1449,9 +1545,9 @@ fn normalize_group(group: Option<&Value>) -> Value {
         .map(|items| {
             items
                 .iter()
-                .filter_map(|item| {
-                    if item.get("items").is_some() || item.get("logic").is_some() {
-                        Some(normalize_group(Some(item)))
+                .map(|item| {
+                    if is_condition_group(item) {
+                        normalize_group(Some(item))
                     } else {
                         normalize_condition(item)
                     }
@@ -1466,23 +1562,42 @@ fn normalize_group(group: Option<&Value>) -> Value {
     })
 }
 
-fn normalize_condition(condition: &Value) -> Option<Value> {
-    let object = condition.as_object()?;
-    let kind = trim_string_value(object.get("kind").or_else(|| object.get("type")))?.to_ascii_lowercase();
+fn normalize_condition(condition: &Value) -> Value {
+    let Some(object) = condition.as_object() else {
+        return condition.clone();
+    };
+    let Some(kind) = trim_string_value(object.get("kind").or_else(|| object.get("type"))) else {
+        return condition.clone();
+    };
+    let kind = kind.to_ascii_lowercase();
     if kind == "app_running" || kind == "app_foreground" {
-        let app_name = normalize_name_value(
+        let Some(app_name) = normalize_condition_text(
             object
                 .get("app_name")
                 .or_else(|| object.get("appName"))
                 .or_else(|| object.get("value")),
-        )?;
-        return Some(json!({ "kind": kind, "app_name": app_name }));
+        ) else {
+            return condition.clone();
+        };
+        return json!({ "kind": kind, "app_name": app_name });
     }
     if kind == "window_title_contains" {
-        let value = normalize_name_value(object.get("value").or_else(|| object.get("text")))?;
-        return Some(json!({ "kind": kind, "value": value }));
+        let Some(value) = normalize_condition_text(object.get("value").or_else(|| object.get("text"))) else {
+            return condition.clone();
+        };
+        return json!({ "kind": kind, "value": value });
     }
-    None
+    if kind == "media_playing" {
+        return json!({ "kind": kind });
+    }
+    if kind == "media_source_app" {
+        // Keep an invalid media condition in place so normalization cannot turn it
+        // into an empty AND group, which would otherwise match unconditionally.
+        let source_app_id = media::normalize_source_app_id(object.get("source_app_id"));
+        return json!({ "kind": kind, "source_app_id": source_app_id });
+    }
+    // Future kinds (including their own items/logic fields) are opaque, lossless data.
+    condition.clone()
 }
 
 fn scope_from_any(value: &Value) -> Option<Value> {
@@ -1583,6 +1698,12 @@ fn normalize_name(value: Option<&str>) -> Option<String> {
 
 fn normalize_name_value(value: Option<&Value>) -> Option<String> {
     trim_string_value(value).and_then(|value| normalize_name(Some(value.as_str())))
+}
+
+// Condition operands are typed strings. Do not coerce booleans/numbers into
+// plausible application names or window text, including during NOT preflight.
+fn normalize_condition_text(value: Option<&Value>) -> Option<String> {
+    normalize_name(value.and_then(Value::as_str))
 }
 
 fn normalize_boolean(value: Option<&Value>, fallback: bool) -> bool {

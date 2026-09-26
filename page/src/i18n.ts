@@ -46,6 +46,13 @@ const bundles = {
     appRunning: 'App is running',
     appForeground: 'App is foreground',
     windowTitleContains: 'Window title contains',
+    mediaPlaying: 'Media session is playing',
+    mediaSourceApp: 'Media source app',
+    mediaSourceId: 'Media AppUserModelId',
+    mediaPlayingHint: 'Uses the current Windows media session, not audible output. Unavailable or unknown media makes this entire rule ineligible, including NOT / OR groups.',
+    mediaSourceHint: 'Exact AppUserModelId match (trimmed, ASCII case-insensitive), not an .exe name. Combine with “Media session is playing” to require playback.',
+    invalidConditionHint: 'Enter a non-empty value. Until corrected or explicitly removed, this condition prevents the entire rule from matching.',
+    unsupportedConditionHint: 'Unsupported or malformed condition. Its data is preserved unchanged. This rule cannot match; use a compatible plugin/editor or explicitly remove this condition.',
     appName: 'App name',
     windowText: 'Window text',
     scope: 'Scope',
@@ -121,6 +128,13 @@ const bundles = {
     appRunning: '应用正在运行',
     appForeground: '应用处于前台',
     windowTitleContains: '窗口标题包含',
+    mediaPlaying: '媒体会话正在播放',
+    mediaSourceApp: '媒体来源应用',
+    mediaSourceId: '媒体 AppUserModelId',
+    mediaPlayingHint: '依据当前 Windows 媒体会话，不代表实际有声音。媒体不可用或未知时，整条规则不匹配，包括取反和“或”分组。',
+    mediaSourceHint: '填写媒体来源 AppUserModelId，不是 .exe 进程名。去除首尾空格后精确比较，忽略 ASCII 大小写；要求正在播放时请组合“媒体会话正在播放”。',
+    invalidConditionHint: '请输入非空值。在修正或明确移除此条件前，整条规则不会匹配。',
+    unsupportedConditionHint: '不支持或格式损坏的条件，原始数据将完整保留。整条规则不会匹配；请使用兼容的插件及编辑器，或明确移除此条件。',
     appName: '应用名',
     windowText: '窗口文本',
     scope: '作用域',
@@ -196,6 +210,13 @@ const bundles = {
     appRunning: '應用程式正在執行',
     appForeground: '應用程式位於前景',
     windowTitleContains: '視窗標題包含',
+    mediaPlaying: '媒體工作階段正在播放',
+    mediaSourceApp: '媒體來源應用程式',
+    mediaSourceId: '媒體 AppUserModelId',
+    mediaPlayingHint: '依據目前 Windows 媒體工作階段，不代表實際有聲音。媒體不可用或未知時，整條規則不匹配，包括取反和「或」群組。',
+    mediaSourceHint: '填寫媒體來源 AppUserModelId，不是 .exe 處理程序名稱。去除首尾空白後精確比較，忽略 ASCII 大小寫；要求正在播放時請組合「媒體工作階段正在播放」。',
+    invalidConditionHint: '請輸入非空值。在修正或明確移除此條件前，整條規則不會匹配。',
+    unsupportedConditionHint: '不支援或格式損壞的條件，原始資料將完整保留。整條規則不會匹配；請使用相容的外掛及編輯器，或明確移除此條件。',
     appName: '應用程式名稱',
     windowText: '視窗文字',
     scope: '範圍',
@@ -631,7 +652,7 @@ function resolveLocale(): SupportedLocale {
 }
 
 let locale: SupportedLocale = resolveLocale()
-let currentMessages = bundles[locale] ?? bundles[DEFAULT_LOCALE]
+let currentMessages: Messages = bundles[locale] ?? bundles[DEFAULT_LOCALE]
 
 const listeners = new Set<() => void>()
 
@@ -649,7 +670,7 @@ function getSnapshot() {
 }
 
 export function t(key: MessageKey) {
-  return currentMessages[key] ?? bundles[DEFAULT_LOCALE][key] ?? key
+  return currentMessages[key] ?? bundles['en-US'][key] ?? key
 }
 
 export function currentLocale() {

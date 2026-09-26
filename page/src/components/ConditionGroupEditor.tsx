@@ -11,6 +11,7 @@ import {
 } from '@chakra-ui/react'
 import type { ReactNode } from 'react'
 import { t } from '../i18n'
+import { conditionText, createCondition, isEditableCondition } from '../config'
 import type { ConditionGroup, ConditionLeaf } from '../types'
 import { cloneData, createEmptyConditionGroup, isConditionGroup } from '../types'
 
@@ -39,11 +40,52 @@ function SelectField(props: {
   )
 }
 
-function createEmptyCondition(): ConditionLeaf {
-  return {
-    kind: 'app_running',
-    app_name: '',
-  }
+function ConditionEditor({ condition, onChange, runningApps }: {
+  condition: ConditionLeaf
+  onChange: (next: ConditionLeaf) => void
+  runningApps: string[]
+}) {
+  const field = condition.kind === 'media_source_app' ? 'source_app_id'
+    : condition.kind === 'window_title_contains' ? 'value' : 'app_name'
+  const text = conditionText(condition[field])
+  const isApp = condition.kind === 'app_running' || condition.kind === 'app_foreground'
+  return (
+    <>
+      <Field.Root>
+        <Field.Label>{t('kind')}</Field.Label>
+        <SelectField value={condition.kind} onChange={(value) => {
+          const next = { kind: value }
+          if (isEditableCondition(next)) {
+            onChange(createCondition(next.kind))
+          }
+        }}>
+          <option value="app_running">{t('appRunning')}</option>
+          <option value="app_foreground">{t('appForeground')}</option>
+          <option value="window_title_contains">{t('windowTitleContains')}</option>
+          <option value="media_playing">{t('mediaPlaying')}</option>
+          <option value="media_source_app">{t('mediaSourceApp')}</option>
+        </SelectField>
+      </Field.Root>
+      {condition.kind === 'media_playing' ? (
+        <Text fontSize="sm" color="fg.muted">{t('mediaPlayingHint')}</Text>
+      ) : (
+        <Field.Root invalid={!text.trim()}>
+          <Field.Label>{t(isApp ? 'appName' : field === 'value' ? 'windowText' : 'mediaSourceId')}</Field.Label>
+          <Input
+            list={isApp ? 'automatic-running-apps' : undefined}
+            value={text}
+            onChange={(event) => onChange({ ...condition, [field]: event.currentTarget.value })}
+          />
+          {condition.kind === 'media_source_app' ? (
+            <Field.HelperText>{t('mediaSourceHint')}</Field.HelperText>
+          ) : isApp && runningApps.length > 0 ? (
+            <Field.HelperText>{runningApps.slice(0, 6).join(', ')}</Field.HelperText>
+          ) : null}
+          <Field.ErrorText color="fg">{t('invalidConditionHint')}</Field.ErrorText>
+        </Field.Root>
+      )}
+    </>
+  )
 }
 
 export function ConditionGroupEditor({
@@ -52,7 +94,7 @@ export function ConditionGroupEditor({
   runningApps,
   depth = 0,
 }: Props) {
-  function updateItem(index: number, nextItem: ConditionGroup | ConditionLeaf) {
+  function updateItem(index: number, nextItem: unknown) {
     const nextGroup = cloneData(group)
     nextGroup.items[index] = nextItem
     onChange(nextGroup)
@@ -109,7 +151,7 @@ export function ConditionGroupEditor({
               onClick={() =>
                 onChange({
                   ...group,
-                  items: [...group.items, createEmptyCondition()],
+                  items: [...group.items, createCondition('app_running')],
                 })
               }
             >
@@ -184,62 +226,14 @@ export function ConditionGroupEditor({
                     </Button>
                   </HStack>
 
-                  <Field.Root>
-                    <Field.Label>{t('kind')}</Field.Label>
-                    <SelectField
-                      value={item.kind}
-                      onChange={(value) => {
-                        const nextKind =
-                          value === 'app_foreground' || value === 'window_title_contains'
-                            ? value
-                            : 'app_running'
-                        updateItem(index, {
-                          kind: nextKind,
-                          app_name: nextKind === 'window_title_contains' ? undefined : '',
-                          value: nextKind === 'window_title_contains' ? '' : undefined,
-                        })
-                      }}
-                    >
-                      <option value="app_running">{t('appRunning')}</option>
-                      <option value="app_foreground">{t('appForeground')}</option>
-                      <option value="window_title_contains">
-                        {t('windowTitleContains')}
-                      </option>
-                    </SelectField>
-                  </Field.Root>
-
-                  {item.kind === 'window_title_contains' ? (
-                    <Field.Root>
-                      <Field.Label>{t('windowText')}</Field.Label>
-                      <Input
-                        value={item.value ?? ''}
-                        onChange={(event) =>
-                          updateItem(index, {
-                            ...item,
-                            value: event.currentTarget.value,
-                          })
-                        }
-                      />
-                    </Field.Root>
+                  {isEditableCondition(item) ? (
+                    <ConditionEditor
+                      condition={item}
+                      onChange={(next) => updateItem(index, next)}
+                      runningApps={runningApps}
+                    />
                   ) : (
-                    <Field.Root>
-                      <Field.Label>{t('appName')}</Field.Label>
-                      <Input
-                        list="automatic-running-apps"
-                        value={item.app_name ?? ''}
-                        onChange={(event) =>
-                          updateItem(index, {
-                            ...item,
-                            app_name: event.currentTarget.value,
-                          })
-                        }
-                      />
-                      {runningApps.length > 0 ? (
-                        <Field.HelperText>
-                          {runningApps.slice(0, 6).join(', ')}
-                        </Field.HelperText>
-                      ) : null}
-                    </Field.Root>
+                    <Text fontSize="sm" color="fg.muted">{t('unsupportedConditionHint')}</Text>
                   )}
                 </Stack>
               )}

@@ -10,7 +10,7 @@
     "windows-x86_64": "native/windows-x86_64/automatic.dll"
   },
   "page": "page/dist/index.html",
-  "permissions": [],
+  "permissions": ["media:session"],
   "description": "meta.description",
   "repository": "https://github.com/skydimo/skydimo-plugins",
   "license": "MIT"

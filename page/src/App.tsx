@@ -17,11 +17,11 @@ import {
 } from '@chakra-ui/react'
 import { startTransition, useEffect, useEffectEvent, useState } from 'react'
 import { bridge } from './bridge'
+import { normalizeActions, normalizeConfig } from './config'
 import { t, useLocale } from './i18n'
 import { RuleEditorDrawer, type EditorState } from './components/RuleEditorDrawer'
 import type {
   ActivityEntry,
-  AutomaticConfig,
   BridgeEvent,
   BridgeStatus,
   RuleConfig,
@@ -33,7 +33,6 @@ import type {
 } from './types'
 import {
   cloneData,
-  createEmptyConditionGroup,
   createEmptyRule,
   EMPTY_SCHEDULER_STATE,
   EMPTY_SNAPSHOT,
@@ -74,107 +73,6 @@ function flattenScopeOptions(devices: typeof EMPTY_SNAPSHOT.devices): ScopeOptio
   }
 
   return options
-}
-
-function normalizeActions(actions: unknown): ScopeAction[] {
-  if (!Array.isArray(actions)) {
-    return []
-  }
-
-  return actions
-    .filter((action) => action && typeof action === 'object')
-    .map((action) => {
-      const value = action as Partial<ScopeAction>
-      return {
-        scope:
-          value.scope && typeof value.scope === 'object' && typeof value.scope.port === 'string'
-            ? value.scope
-            : { port: '' },
-        effectId: typeof value.effectId === 'string' ? value.effectId : undefined,
-        params:
-          value.params && typeof value.params === 'object' && !Array.isArray(value.params)
-            ? value.params
-            : {},
-        brightness: typeof value.brightness === 'number' ? value.brightness : undefined,
-        powerOff: typeof value.powerOff === 'boolean' ? value.powerOff : undefined,
-        paused: typeof value.paused === 'boolean' ? value.paused : undefined,
-      }
-    })
-}
-
-function normalizeConditionGroup(input: unknown): RuleConfig['conditions'] {
-  if (!input || typeof input !== 'object') {
-    return createEmptyConditionGroup()
-  }
-
-  const value = input as {
-    logic?: unknown
-    negated?: unknown
-    items?: unknown
-    kind?: unknown
-    app_name?: unknown
-    value?: unknown
-  }
-
-  if (!Array.isArray(value.items)) {
-    return createEmptyConditionGroup()
-  }
-
-  return {
-    logic: value.logic === 'or' ? 'or' : 'and',
-    negated: value.negated === true,
-    items: value.items
-      .filter((item) => item && typeof item === 'object')
-      .map((item) => {
-        const child = item as {
-          items?: unknown
-          logic?: unknown
-          negated?: unknown
-          kind?: unknown
-          app_name?: unknown
-          value?: unknown
-        }
-
-        if (Array.isArray(child.items)) {
-          return normalizeConditionGroup(child)
-        }
-
-        return {
-          kind:
-            child.kind === 'app_foreground' || child.kind === 'window_title_contains'
-              ? child.kind
-              : 'app_running',
-          app_name: typeof child.app_name === 'string' ? child.app_name : undefined,
-          value: typeof child.value === 'string' ? child.value : undefined,
-        }
-      }),
-  }
-}
-
-function normalizeConfig(config?: Partial<AutomaticConfig>): AutomaticConfig {
-  return {
-    enabled: config?.enabled !== false,
-    baseline: {
-      actions: normalizeActions(config?.baseline?.actions),
-    },
-    rules: Array.isArray(config?.rules)
-      ? config.rules
-          .filter((rule) => rule && typeof rule === 'object')
-          .map((rule, index) => {
-            const value = rule as Partial<RuleConfig>
-            return {
-              id:
-                typeof value.id === 'string' && value.id.length > 0
-                  ? value.id
-                  : `rule-${index}`,
-              enabled: value.enabled !== false,
-              name: typeof value.name === 'string' ? value.name : '',
-              conditions: normalizeConditionGroup(value.conditions),
-              actions: normalizeActions(value.actions),
-            }
-          })
-      : [],
-  }
 }
 
 function normalizeSnapshot(snapshot?: Partial<SnapshotPayload>): SnapshotPayload {
