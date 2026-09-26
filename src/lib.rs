@@ -1046,6 +1046,15 @@ fn apply_actions(
     plan_key: Option<&str>,
     actions: &[Value],
 ) -> ApplyResult {
+    apply_actions_with(state, plan_key, actions, |action| execute_action(host, action))
+}
+
+fn apply_actions_with(
+    state: &mut RuntimeState,
+    plan_key: Option<&str>,
+    actions: &[Value],
+    mut execute: impl FnMut(&Value) -> Result<(), String>,
+) -> ApplyResult {
     let mut result = ApplyResult {
         applied: Vec::new(),
         skipped: Vec::new(),
@@ -1061,24 +1070,25 @@ fn apply_actions(
     for action in actions {
         let scope_key = action.get("scope").and_then(scope_key);
         let signature = stable_signature(&action_signature(action));
-        if let Some(scope_key) = scope_key.clone() {
-            next_signatures.insert(scope_key.clone(), signature.clone());
-        }
-
         if scope_key.as_ref().is_some_and(|key| {
             state.current_plan_key.as_deref() == Some(plan_key)
                 && state.applied_signatures.get(key) == Some(&signature)
         }) {
+            if let Some(key) = scope_key { next_signatures.insert(key, signature); }
             result.skipped.push(json!({
                 "scope": action.get("scope").cloned().unwrap_or(Value::Null),
             }));
             continue;
         }
 
-        match execute_action(host, action) {
-            Ok(()) => result.applied.push(json!({
-                "scope": action.get("scope").cloned().unwrap_or(Value::Null),
-            })),
+        match execute(action) {
+            Ok(()) => {
+                // A failed action must remain eligible when its device returns.
+                if let Some(key) = scope_key { next_signatures.insert(key, signature); }
+                result.applied.push(json!({
+                    "scope": action.get("scope").cloned().unwrap_or(Value::Null),
+                }));
+            }
             Err(err) => {
                 let mut row = Map::new();
                 row.insert("message".into(), Value::String(err));
@@ -2039,4 +2049,46 @@ fn ptr_len_to_string(ptr: *const c_char, len: usize) -> String {
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
     String::from_utf8_lossy(bytes).into_owned()
+}
+
+#[cfg(test)]
+mod action_retry_tests {
+    use super::*;
+
+    #[test]
+    fn failed_action_is_retried_then_success_is_cached() {
+        let mut state = RuntimeState::new();
+        let actions = vec![json!({ "scope": { "port": "test-device" }, "effectId": "Rainbow" })];
+        let failed = apply_actions_with(&mut state, Some("rule:1"), &actions, |_| Err("Device not found".into()));
+        assert_eq!(failed.errors.len(), 1);
+        assert!(state.applied_signatures.is_empty());
+        let retried = apply_actions_with(&mut state, Some("rule:1"), &actions, |_| Ok(()));
+        assert_eq!(retried.applied.len(), 1);
+        let skipped = apply_actions_with(&mut state, Some("rule:1"), &actions, |_| panic!("repeated successful action"));
+        assert_eq!(skipped.skipped.len(), 1);
+        assert_eq!(state.applied_signatures.len(), 1);
+    }
+
+    #[test]
+    fn mixed_results_only_retry_failed_scope_and_reset_allows_reapply() {
+        let mut state = RuntimeState::new();
+        let actions = vec![
+            json!({ "scope": { "port": "ready" }, "brightness": 20 }),
+            json!({ "scope": { "port": "missing" }, "brightness": 40 }),
+        ];
+        let first = apply_actions_with(&mut state, Some("rule:1"), &actions, |action| {
+            if action["scope"]["port"] == "missing" { Err("Device not found".into()) } else { Ok(()) }
+        });
+        assert_eq!(first.applied.len(), 1);
+        assert_eq!(first.errors.len(), 1);
+        let retried = apply_actions_with(&mut state, Some("rule:1"), &actions, |action| {
+            assert_eq!(action["scope"]["port"], "missing");
+            Ok(())
+        });
+        assert_eq!(retried.applied.len(), 1);
+        assert_eq!(retried.skipped.len(), 1);
+        apply_actions_with(&mut state, None, &[], |_| panic!("no active plan"));
+        assert!(state.applied_signatures.is_empty());
+        assert_eq!(apply_actions_with(&mut state, Some("rule:1"), &actions, |_| Ok(())).applied.len(), 2);
+    }
 }

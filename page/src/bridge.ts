@@ -10,6 +10,7 @@ import type {
   SystemStatePayload,
 } from './types'
 import { setLocale } from './i18n'
+import { authenticateExtensionSocket } from './extensionPageSession.js'
 
 interface ExtPageEnv {
   extId: string
@@ -278,6 +279,22 @@ class ExtensionBridge {
         }, 3000)
       }
     }
+    this.authenticateSocket(socket)
+  }
+
+  private authenticateSocket(socket: WebSocket) {
+    authenticateExtensionSocket(socket, {
+      onError: (error, request) => {
+        if (this.ws !== socket) return
+        if (error.fatal) this.shouldReconnect = false
+        for (const listener of this.listeners) {
+          listener({ type: 'error', data: {
+            action: request?.params?.data?.type ?? 'connection',
+            message: error.message,
+          } })
+        }
+      },
+    })
   }
 
   disconnect() {
@@ -292,7 +309,7 @@ class ExtensionBridge {
   }
 
   send(type: string, payload: Record<string, unknown> = {}) {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+    if (this.status !== 'connected' || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return
     }
 
