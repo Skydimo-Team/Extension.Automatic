@@ -10,6 +10,7 @@ import type {
   SystemStatePayload,
 } from './types'
 import { setLocale } from './i18n'
+import { isConfigSnapshot, normalizeSkippedActions } from './scheduler'
 import { authenticateExtensionSocket } from './extensionPageSession.js'
 
 interface ExtPageEnv {
@@ -46,11 +47,9 @@ function asArray<T>(value: unknown) {
 function normalizeSnapshot(value: unknown): SnapshotPayload {
   const payload = asRecord(value)
   return {
-    config: (payload.config as AutomaticConfig | undefined) ?? {
-      enabled: true,
-      baseline: { actions: [] },
-      rules: [],
-    },
+    // Preserve an invalid/missing config for App's readiness check; never turn
+    // an incomplete response into an editable empty configuration.
+    config: payload.config as AutomaticConfig,
     devices: asArray(payload.devices),
     effects: asArray(payload.effects),
   }
@@ -134,6 +133,7 @@ function normalizeSchedulerState(value: unknown): SchedulerStatePayload {
     lastAppliedAt:
       typeof payload.lastAppliedAt === 'string' ? payload.lastAppliedAt : undefined,
     lastErrors: asArray(payload.lastErrors),
+    lastSkipped: normalizeSkippedActions(payload.lastSkipped),
   }
 }
 
@@ -146,11 +146,8 @@ function normalizeSaveResult(value: unknown): SaveResultPayload {
   return {
     action: typeof payload.action === 'string' ? payload.action : 'unknown',
     ok: payload.ok === true,
-    config: (payload.config as AutomaticConfig | undefined) ?? {
-      enabled: true,
-      baseline: { actions: [] },
-      rules: [],
-    },
+    requestId: typeof payload.requestId === 'string' ? payload.requestId : undefined,
+    config: isConfigSnapshot(payload.config) ? payload.config as AutomaticConfig : undefined,
   }
 }
 
@@ -159,6 +156,7 @@ function normalizeError(value: unknown): ErrorPayload {
   return {
     action: typeof payload.action === 'string' ? payload.action : 'unknown',
     message: typeof payload.message === 'string' ? payload.message : 'Unknown error',
+    requestId: typeof payload.requestId === 'string' ? payload.requestId : undefined,
   }
 }
 
@@ -287,10 +285,13 @@ class ExtensionBridge {
       onError: (error, request) => {
         if (this.ws !== socket) return
         if (error.fatal) this.shouldReconnect = false
+        const requestId = (request?.params?.data as { requestId?: unknown } | undefined)?.requestId
         for (const listener of this.listeners) {
           listener({ type: 'error', data: {
             action: request?.params?.data?.type ?? 'connection',
             message: error.message,
+            requestId: typeof requestId === 'string' ? requestId : undefined,
+            outcomeUnknown: error.code === 'rpc_timeout',
           } })
         }
       },
@@ -310,7 +311,7 @@ class ExtensionBridge {
 
   send(type: string, payload: Record<string, unknown> = {}) {
     if (this.status !== 'connected' || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      return
+      return false
     }
 
     this.ws.send(JSON.stringify({
@@ -325,6 +326,7 @@ class ExtensionBridge {
         },
       },
     }))
+    return true
   }
 
   private setStatus(status: BridgeStatus) {

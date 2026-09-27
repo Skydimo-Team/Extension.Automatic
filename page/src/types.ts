@@ -226,6 +226,8 @@ export interface SchedulerStatePayload {
     message: string
     scope?: ScopeRef
   }>
+  // Absent on older plugins: absence is not evidence that every action applied.
+  lastSkipped?: Array<{ scope?: ScopeRef; reason: string }>
 }
 
 export interface ActivityEntry {
@@ -239,12 +241,16 @@ export interface ActivityEntry {
 export interface SaveResultPayload {
   action: string
   ok: boolean
-  config: AutomaticConfig
+  requestId?: string
+  config?: AutomaticConfig
 }
 
 export interface ErrorPayload {
+  // Transport timeout means acknowledgement is missing, not that mutation failed.
+  outcomeUnknown?: boolean
   action: string
   message: string
+  requestId?: string
 }
 
 export interface ScopeOption {

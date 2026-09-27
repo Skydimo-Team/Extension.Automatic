@@ -14,11 +14,15 @@ use serde::Serialize;
 use serde_json::{json, Map, Value};
 
 mod media;
+mod action_plan;
+use action_plan::ApplyResult;
 
 #[cfg(test)]
 mod media_tests;
 #[cfg(test)]
 mod condition_tests;
+#[cfg(test)]
+mod ownership_tests;
 
 const SKYDIMO_NATIVE_C_ABI_VERSION: u32 = 2;
 const SKYDIMO_PLUGIN_KIND_EXTENSION: u32 = 1 << 2;
@@ -453,8 +457,7 @@ struct RuntimeState {
     media: media::MediaSnapshot,
     activity: Vec<Value>,
     activity_counter: u64,
-    current_plan_key: Option<String>,
-    applied_signatures: BTreeMap<String, String>,
+    resume_manual: bool,
     previous_summary: Option<String>,
 }
 
@@ -471,8 +474,7 @@ impl RuntimeState {
             media: media::MediaSnapshot::default(),
             activity: Vec::new(),
             activity_counter: 0,
-            current_plan_key: None,
-            applied_signatures: BTreeMap::new(),
+            resume_manual: false,
             previous_summary: None,
         }
     }
@@ -513,6 +515,7 @@ struct AutomaticExtension {
     stop_monitor: Arc<AtomicBool>,
     monitor_thread: Option<thread::JoinHandle<()>>,
     started: bool,
+    ownership_started: bool,
 }
 
 impl AutomaticExtension {
@@ -523,11 +526,12 @@ impl AutomaticExtension {
             stop_monitor: Arc::new(AtomicBool::new(false)),
             monitor_thread: None,
             started: false,
+            ownership_started: false,
         }
     }
 
     fn start(&mut self) -> Result<(), String> {
-        if self.started {
+        if self.started || self.ownership_started {
             self.stop();
         }
         self.stop_monitor.store(false, Ordering::SeqCst);
@@ -576,25 +580,28 @@ impl AutomaticExtension {
             state.media = initial_media;
             emit_snapshot_locked(&self.host, &state);
             emit_system_state_locked(&self.host, &state);
+            self.ownership_started = true;
             recompute_and_emit_locked(&self.host, &mut state, "bootstrap");
         }
 
         let host = self.host;
         let state = Arc::clone(&self.state);
         let stop = Arc::clone(&self.stop_monitor);
-        self.monitor_thread = Some(
-            thread::Builder::new()
-                .name("automatic-monitor".to_string())
-                .spawn(move || monitor_loop(host, state, stop))
-                .map_err(|err| err.to_string())?,
-        );
+        match thread::Builder::new().name("automatic-monitor".to_string())
+            .spawn(move || monitor_loop(host, state, stop)) {
+            Ok(handle) => self.monitor_thread = Some(handle),
+            Err(err) => {
+                self.stop();
+                return Err(err.to_string());
+            }
+        }
         self.started = true;
 
         Ok(())
     }
 
     fn stop(&mut self) {
-        if !self.started && self.monitor_thread.is_none() {
+        if !self.started && self.monitor_thread.is_none() && !self.ownership_started {
             return;
         }
         self.started = false;
@@ -602,9 +609,19 @@ impl AutomaticExtension {
         if let Some(handle) = self.monitor_thread.take() {
             let _ = handle.join();
         }
+        // Release even after partial startup, without trusting a potentially
+        // poisoned plugin state mutex. Core also releases this host generation.
+        self.ownership_started = false;
+        let result = action_plan::reconcile_with(None, &[], false, |method, request| self.host.call_json(method, request));
+        for error in result.errors {
+            if let Some(message) = error.get("message").and_then(Value::as_str) {
+                self.host.log(SKYDIMO_LOG_WARN, message);
+            }
+        }
     }
 
     fn handle_event(&mut self, event: &str, data: Value) -> Result<(), String> {
+        if !self.started { return Ok(()); }
         if matches!(event, "system.media.changed" | "system.media.playback_changed") {
             let mut state = self
                 .state
@@ -633,9 +650,12 @@ impl AutomaticExtension {
     }
 
     fn handle_page_message(&mut self, message: Value) -> Result<(), String> {
+        if !self.started { return Ok(()); }
         let Some(message_type) = message.get("type").and_then(Value::as_str) else {
             return Ok(());
         };
+        let request_id = message.get("requestId").and_then(Value::as_str)
+            .filter(|id| !id.is_empty() && id.len() <= 128);
 
         let mut state = self
             .state
@@ -650,12 +670,12 @@ impl AutomaticExtension {
             }
             "save_config" => {
                 let next = normalize_config(message.get("config").cloned().unwrap_or(Value::Null));
-                save_config_locked(&self.host, &mut state, next, "save_config");
+                save_config_locked(&self.host, &mut state, next, "save_config", request_id);
             }
             "set_enabled" => {
                 let mut next = state.config.clone();
                 set_object_field(&mut next, "enabled", Value::Bool(message.get("enabled") == Some(&Value::Bool(true))));
-                save_config_locked(&self.host, &mut state, normalize_config(next), "set_enabled");
+                save_config_locked(&self.host, &mut state, normalize_config(next), "set_enabled", request_id);
             }
             "delete_rule" => {
                 let rule_id = trim_string_value(
@@ -669,9 +689,9 @@ impl AutomaticExtension {
                     if let Some(rules) = next.get_mut("rules").and_then(Value::as_array_mut) {
                         rules.retain(|rule| rule.get("id").and_then(Value::as_str) != Some(rule_id.as_str()));
                     }
-                    save_config_locked(&self.host, &mut state, normalize_config(next), "delete_rule");
+                    save_config_locked(&self.host, &mut state, normalize_config(next), "delete_rule", request_id);
                 } else {
-                    emit_error_locked(&self.host, &mut state, "delete_rule", "ruleId is required");
+                    emit_request_error_locked(&self.host, &mut state, "delete_rule", "ruleId is required", request_id);
                 }
             }
             "reorder_rules" => {
@@ -712,9 +732,9 @@ impl AutomaticExtension {
                             })
                         });
                     }
-                    save_config_locked(&self.host, &mut state, normalize_config(next), "reorder_rules");
+                    save_config_locked(&self.host, &mut state, normalize_config(next), "reorder_rules", request_id);
                 } else {
-                    emit_error_locked(&self.host, &mut state, "reorder_rules", "ruleIds must be an array");
+                    emit_request_error_locked(&self.host, &mut state, "reorder_rules", "ruleIds must be an array", request_id);
                 }
             }
             "recompute" => {
@@ -732,10 +752,15 @@ impl Drop for AutomaticExtension {
     }
 }
 
-fn save_config_locked(host: &HostBridge, state: &mut RuntimeState, config: Value, action: &str) {
-    state.config = config;
-    match write_config(&state.data_dir, &state.config) {
+fn save_config_locked(host: &HostBridge, state: &mut RuntimeState, config: Value, action: &str, request_id: Option<&str>) {
+    // Persist first: a failed save cannot apply a draft or silently re-arm a
+    // manual hold. Only an explicit disabled -> enabled edit requests resume.
+    let resume_manual = state.config.get("enabled") == Some(&Value::Bool(false))
+        && config.get("enabled") == Some(&Value::Bool(true));
+    match write_config(&state.data_dir, &config) {
         Ok(()) => {
+            state.config = config;
+            state.resume_manual = resume_manual;
             let rule_count = state
                 .config
                 .get("rules")
@@ -763,16 +788,11 @@ fn save_config_locked(host: &HostBridge, state: &mut RuntimeState, config: Value
             state.push_activity("config", title, Some(detail));
             emit_snapshot_locked(host, state);
             recompute_and_emit_locked(host, state, action);
-            host.emit_page(
-                "save_result",
-                json!({
-                    "action": action,
-                    "ok": true,
-                    "config": state.config,
-                }),
-            );
+            host.emit_page("save_result", with_request_id(json!({
+                "action": action, "ok": true, "config": state.config,
+            }), request_id));
         }
-        Err(err) => emit_error_locked(host, state, action, &err),
+        Err(err) => emit_request_error_locked(host, state, action, &err, request_id),
     }
 }
 
@@ -832,6 +852,10 @@ fn monitor_loop(host: HostBridge, state: Arc<Mutex<RuntimeState>>, stop: Arc<Ato
             };
             emit_system_state_locked(&host, &guard);
             recompute_and_emit_locked(&host, &mut guard, reason);
+        } else {
+            // Core leases expire without liveness. Renew even when rule inputs
+            // are unchanged; Core must still report manual/preview ownership.
+            recompute_and_emit_locked(&host, &mut guard, "heartbeat");
         }
     }
 }
@@ -891,21 +915,35 @@ fn emit_activity_locked(host: &HostBridge, state: &RuntimeState) {
 }
 
 fn emit_error_locked(host: &HostBridge, state: &mut RuntimeState, action: &str, message: &str) {
+    emit_request_error_locked(host, state, action, message, None);
+}
+
+fn with_request_id(mut payload: Value, request_id: Option<&str>) -> Value {
+    if let Some(request_id) = request_id {
+        payload["requestId"] = Value::String(request_id.to_string());
+    }
+    payload
+}
+
+fn emit_request_error_locked(host: &HostBridge, state: &mut RuntimeState, action: &str, message: &str, request_id: Option<&str>) {
     state.push_activity("error", action, Some(message.to_string()));
     host.emit_page(
         "error",
-        json!({
+        with_request_id(json!({
             "action": action,
             "message": message,
-        }),
+        }), request_id),
     );
     emit_activity_locked(host, state);
 }
 
 fn recompute_and_emit_locked(host: &HostBridge, state: &mut RuntimeState, reason: &str) {
+    let previous_errors = state.scheduler.get("lastErrors").cloned();
+    let previous_activity = state.activity_counter;
     let result = recompute_locked(host, state, reason);
     emit_scheduler_locked(host, state);
-    emit_activity_locked(host, state);
+    if state.activity_counter != previous_activity { emit_activity_locked(host, state); }
+    if previous_errors.as_ref() == Some(&json!(result.errors)) { return; }
     if let Some(error) = result
         .errors
         .first()
@@ -920,12 +958,6 @@ fn recompute_and_emit_locked(host: &HostBridge, state: &mut RuntimeState, reason
             }),
         );
     }
-}
-
-struct ApplyResult {
-    applied: Vec<Value>,
-    skipped: Vec<Value>,
-    errors: Vec<Value>,
 }
 
 fn recompute_locked(host: &HostBridge, state: &mut RuntimeState, reason: &str) -> ApplyResult {
@@ -967,6 +999,7 @@ fn recompute_locked(host: &HostBridge, state: &mut RuntimeState, reason: &str) -
 
     let active_rule_id = active_rule
         .as_ref()
+        .filter(|_| active_source == "rule")
         .and_then(|rule| rule.get("id"))
         .and_then(Value::as_str)
         .map(str::to_string);
@@ -1014,6 +1047,7 @@ fn recompute_locked(host: &HostBridge, state: &mut RuntimeState, reason: &str) -
         scheduler.insert("lastAppliedAt".into(), Value::String(previous));
     }
     scheduler.insert("lastErrors".into(), Value::Array(apply_result.errors.clone()));
+    scheduler.insert("lastSkipped".into(), Value::Array(apply_result.skipped.clone()));
     state.scheduler = Value::Object(scheduler);
 
     let summary = stable_signature(&json!({
@@ -1022,15 +1056,18 @@ fn recompute_locked(host: &HostBridge, state: &mut RuntimeState, reason: &str) -
         "activeRuleId": state.scheduler.get("activeRuleId").cloned().unwrap_or(Value::Null),
         "activeSource": active_source,
         "lastErrors": apply_result.errors,
+        "lastSkipped": apply_result.skipped,
     }));
 
     if state.previous_summary.as_deref() != Some(summary.as_str())
         || !apply_result.applied.is_empty()
-        || !apply_result.errors.is_empty()
     {
+        let held = apply_result.skipped.iter()
+            .filter(|entry| entry.get("reason").and_then(Value::as_str) != Some("unchanged"))
+            .count();
         let detail = match state.scheduler.get("activeSource").and_then(Value::as_str) {
             Some("rule") => format!(
-                "Applied rule {} ({}) after {}",
+                "Selected rule {} ({}) after {}",
                 state
                     .scheduler
                     .get("activeName")
@@ -1044,18 +1081,24 @@ fn recompute_locked(host: &HostBridge, state: &mut RuntimeState, reason: &str) -
                     .unwrap_or("n/a"),
                 reason
             ),
-            Some("baseline") => format!("Applied baseline after {reason}"),
+            Some("baseline") => format!("Selected baseline after {reason}"),
             _ if state.scheduler.get("enabled") == Some(&Value::Bool(false)) => {
                 "Automation disabled, scheduler is idle".to_string()
             }
             _ => format!("No rule matched after {reason}"),
         };
         state.push_activity("scheduler", "Scheduler recomputed", Some(detail));
+        if held > 0 {
+            state.push_activity("scheduler", "Automation yielded control",
+                Some(format!("{held} action(s) held; selected plan was not fully applied")));
+        }
     }
 
-    for error in &apply_result.errors {
-        if let Some(message) = error.get("message").and_then(Value::as_str) {
-            state.push_activity("error", "Action apply failed", Some(message.to_string()));
+    if state.previous_summary.as_deref() != Some(summary.as_str()) {
+        for error in &apply_result.errors {
+            if let Some(message) = error.get("message").and_then(Value::as_str) {
+                state.push_activity("error", "Action apply failed", Some(message.to_string()));
+            }
         }
     }
     state.previous_summary = Some(summary);
@@ -1097,124 +1140,8 @@ fn apply_actions(
     plan_key: Option<&str>,
     actions: &[Value],
 ) -> ApplyResult {
-    apply_actions_with(state, plan_key, actions, |action| execute_action(host, action))
-}
-
-fn apply_actions_with(
-    state: &mut RuntimeState,
-    plan_key: Option<&str>,
-    actions: &[Value],
-    mut execute: impl FnMut(&Value) -> Result<(), String>,
-) -> ApplyResult {
-    let mut result = ApplyResult {
-        applied: Vec::new(),
-        skipped: Vec::new(),
-        errors: Vec::new(),
-    };
-    let Some(plan_key) = plan_key else {
-        state.current_plan_key = None;
-        state.applied_signatures.clear();
-        return result;
-    };
-
-    let mut next_signatures = BTreeMap::new();
-    for action in actions {
-        let scope_key = action.get("scope").and_then(scope_key);
-        let signature = stable_signature(&action_signature(action));
-        if scope_key.as_ref().is_some_and(|key| {
-            state.current_plan_key.as_deref() == Some(plan_key)
-                && state.applied_signatures.get(key) == Some(&signature)
-        }) {
-            if let Some(key) = scope_key { next_signatures.insert(key, signature); }
-            result.skipped.push(json!({
-                "scope": action.get("scope").cloned().unwrap_or(Value::Null),
-            }));
-            continue;
-        }
-
-        match execute(action) {
-            Ok(()) => {
-                // A failed action must remain eligible when its device returns.
-                if let Some(key) = scope_key { next_signatures.insert(key, signature); }
-                result.applied.push(json!({
-                    "scope": action.get("scope").cloned().unwrap_or(Value::Null),
-                }));
-            }
-            Err(err) => {
-                let mut row = Map::new();
-                row.insert("message".into(), Value::String(err));
-                if let Some(scope) = action.get("scope").cloned() {
-                    row.insert("scope".into(), scope);
-                }
-                result.errors.push(Value::Object(row));
-            }
-        }
-    }
-
-    state.current_plan_key = Some(plan_key.to_string());
-    state.applied_signatures = next_signatures;
-    result
-}
-
-fn execute_action(host: &HostBridge, action: &Value) -> Result<(), String> {
-    let scope = action
-        .get("scope")
-        .and_then(scope_from_any)
-        .ok_or_else(|| "invalid scope".to_string())?;
-
-    if action.get("powerOff") == Some(&Value::Bool(false)) {
-        host.call_json("set_scope_power", &json!({ "scope": scope, "is_off": false }))?;
-    }
-
-    if let Some(effect_id) = action.get("effectId").and_then(Value::as_str) {
-        host.call_json(
-            "set_scope_effect",
-            &json!({
-                "scope": scope,
-                "effect_id": effect_id,
-                "params": action.get("params").cloned().unwrap_or_else(empty_object),
-            }),
-        )?;
-    } else if !value_is_empty(action.get("params").unwrap_or(&Value::Null)) {
-        host.call_json(
-            "update_scope_effect_params",
-            &json!({
-                "scope": scope,
-                "params": action.get("params").cloned().unwrap_or_else(empty_object),
-            }),
-        )?;
-    }
-
-    if let Some(brightness) = action.get("brightness").and_then(Value::as_u64) {
-        host.call_json(
-            "set_scope_brightness",
-            &json!({ "scope": scope, "brightness": brightness.min(100) }),
-        )?;
-    }
-
-    if let Some(paused) = action.get("paused").and_then(Value::as_bool) {
-        host.call_json(
-            "set_scope_mode_paused",
-            &json!({ "scope": scope, "paused": paused }),
-        )?;
-    }
-
-    if action.get("powerOff") == Some(&Value::Bool(true)) {
-        host.call_json("set_scope_power", &json!({ "scope": scope, "is_off": true }))?;
-    }
-
-    Ok(())
-}
-
-fn action_signature(action: &Value) -> Value {
-    json!({
-        "scope": action.get("scope").and_then(scope_from_any),
-        "effectId": action.get("effectId").and_then(Value::as_str),
-        "params": action.get("params").cloned().unwrap_or_else(empty_object),
-        "brightness": action.get("brightness").cloned().unwrap_or(Value::Null),
-        "powerOff": action.get("powerOff").cloned().unwrap_or(Value::Null),
-        "paused": action.get("paused").cloned().unwrap_or(Value::Null),
-    })
+    let resume_manual = std::mem::take(&mut state.resume_manual);
+    action_plan::reconcile_with(plan_key, actions, resume_manual, |method, request| host.call_json(method, request))
 }
 
 fn matches_group(group: &Value, snapshot: &Value) -> bool {
@@ -1746,6 +1673,7 @@ fn empty_scheduler_state() -> Value {
         "activeActions": [],
         "rules": [],
         "lastErrors": [],
+        "lastSkipped": [],
     })
 }
 
@@ -2170,46 +2098,4 @@ fn ptr_len_to_string(ptr: *const c_char, len: usize) -> String {
     }
     let bytes = unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) };
     String::from_utf8_lossy(bytes).into_owned()
-}
-
-#[cfg(test)]
-mod action_retry_tests {
-    use super::*;
-
-    #[test]
-    fn failed_action_is_retried_then_success_is_cached() {
-        let mut state = RuntimeState::new();
-        let actions = vec![json!({ "scope": { "port": "test-device" }, "effectId": "Rainbow" })];
-        let failed = apply_actions_with(&mut state, Some("rule:1"), &actions, |_| Err("Device not found".into()));
-        assert_eq!(failed.errors.len(), 1);
-        assert!(state.applied_signatures.is_empty());
-        let retried = apply_actions_with(&mut state, Some("rule:1"), &actions, |_| Ok(()));
-        assert_eq!(retried.applied.len(), 1);
-        let skipped = apply_actions_with(&mut state, Some("rule:1"), &actions, |_| panic!("repeated successful action"));
-        assert_eq!(skipped.skipped.len(), 1);
-        assert_eq!(state.applied_signatures.len(), 1);
-    }
-
-    #[test]
-    fn mixed_results_only_retry_failed_scope_and_reset_allows_reapply() {
-        let mut state = RuntimeState::new();
-        let actions = vec![
-            json!({ "scope": { "port": "ready" }, "brightness": 20 }),
-            json!({ "scope": { "port": "missing" }, "brightness": 40 }),
-        ];
-        let first = apply_actions_with(&mut state, Some("rule:1"), &actions, |action| {
-            if action["scope"]["port"] == "missing" { Err("Device not found".into()) } else { Ok(()) }
-        });
-        assert_eq!(first.applied.len(), 1);
-        assert_eq!(first.errors.len(), 1);
-        let retried = apply_actions_with(&mut state, Some("rule:1"), &actions, |action| {
-            assert_eq!(action["scope"]["port"], "missing");
-            Ok(())
-        });
-        assert_eq!(retried.applied.len(), 1);
-        assert_eq!(retried.skipped.len(), 1);
-        apply_actions_with(&mut state, None, &[], |_| panic!("no active plan"));
-        assert!(state.applied_signatures.is_empty());
-        assert_eq!(apply_actions_with(&mut state, Some("rule:1"), &actions, |_| Ok(())).applied.len(), 2);
-    }
 }

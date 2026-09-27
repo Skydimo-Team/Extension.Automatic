@@ -1,4 +1,5 @@
 import {
+  Alert,
   Box,
   Button,
   Checkbox,
@@ -29,6 +30,10 @@ export type EditorState =
 
 interface Props {
   open: boolean
+  busy?: boolean
+  saveDisabled?: boolean
+  error?: string
+  onReload?: () => void
   editor: EditorState | null
   effects: EffectInfo[]
   scopeOptions: ScopeOption[]
@@ -55,11 +60,16 @@ function DrawerEditorContent(props: Props & { editor: EditorState }) {
       <Drawer.Header>
         <Drawer.Title>{title}</Drawer.Title>
         <Drawer.CloseTrigger asChild>
-          <CloseButton size="sm" />
+          <CloseButton size="sm" disabled={props.busy} />
         </Drawer.CloseTrigger>
       </Drawer.Header>
 
       <Drawer.Body>
+        {props.error ? <Alert.Root status="error" mb="4" bg="bg.subtle" color="fg" borderWidth="1px" borderColor="border.subtle"><Alert.Indicator /><Alert.Content>
+          <Alert.Title>{props.error}</Alert.Title>
+          {props.onReload ? <Button size="sm" mt="2" onClick={props.onReload}>{t('reloadState')}</Button> : null}
+        </Alert.Content></Alert.Root> : null}
+        <fieldset disabled={props.busy} style={{ border: 0, padding: 0, minWidth: 0 }}>
         {props.editor.kind === 'baseline' ? (
           <Stack gap="5">
             <Box
@@ -143,15 +153,19 @@ function DrawerEditorContent(props: Props & { editor: EditorState }) {
             </Stack>
           </Stack>
         ) : null}
+        </fieldset>
       </Drawer.Body>
 
       <Drawer.Footer>
         <HStack gap="3">
-          <Button variant="outline" onClick={props.onClose}>
+          <Button variant="outline" disabled={props.busy} onClick={props.onClose}>
             {t('cancel')}
           </Button>
           <Button
             colorPalette="orange"
+            disabled={props.saveDisabled}
+            loading={props.busy}
+            loadingText={t('saving')}
             onClick={() => {
               if (props.editor.kind === 'baseline') {
                 props.onSaveBaseline(baselineDraft)
@@ -178,7 +192,7 @@ export function RuleEditorDrawer(props: Props) {
       size="xl"
       placement={{ mdDown: 'bottom', md: 'end' }}
       onOpenChange={(event) => {
-        if (!event.open) {
+        if (!event.open && !props.busy) {
           props.onClose()
         }
       }}

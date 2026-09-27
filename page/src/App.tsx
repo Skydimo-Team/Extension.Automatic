@@ -1,5 +1,6 @@
 import {
   Badge,
+  Alert,
   Box,
   Button,
   Checkbox,
@@ -15,11 +16,13 @@ import {
   VStack,
   Card,
 } from '@chakra-ui/react'
-import { startTransition, useEffect, useEffectEvent, useState } from 'react'
+import { startTransition, useEffect, useEffectEvent, useRef, useState } from 'react'
 import { bridge } from './bridge'
 import { normalizeActions, normalizeConfig } from './config'
+import { isConfigSnapshot, matchingMutation, normalizeSkippedActions } from './scheduler'
 import { t, useLocale } from './i18n'
 import { RuleEditorDrawer, type EditorState } from './components/RuleEditorDrawer'
+import { SchedulerFeedback } from './components/SchedulerFeedback'
 import type {
   ActivityEntry,
   BridgeEvent,
@@ -211,6 +214,7 @@ function normalizeSchedulerState(
             scope: error.scope,
           }))
       : [],
+    lastSkipped: normalizeSkippedActions(schedulerState?.lastSkipped),
   }
 }
 
@@ -261,10 +265,10 @@ function statusText(status: BridgeStatus) {
 
 function activeSourceText(source: string) {
   if (source === 'rule') {
-    return t('activeRule')
+    return t('selectedRule')
   }
   if (source === 'baseline') {
-    return t('activeBaseline')
+    return t('selectedBaseline')
   }
   return t('idle')
 }
@@ -306,11 +310,30 @@ function App() {
   const [status, setStatus] = useState<BridgeStatus>('disconnected')
   const [editor, setEditor] = useState<EditorState | null>(null)
   const [flash, setFlash] = useState<{ kind: 'error' | 'success'; text: string } | null>(null)
+  const [snapshotReady, setSnapshotReady] = useState(false)
+  const [pendingAction, setPendingAction] = useState<string | null>(null)
+  const [needsReconnect, setNeedsReconnect] = useState(false)
+  const pending = useRef<{ action: string; requestId: string; closeEditor: boolean; timer: ReturnType<typeof setTimeout> } | null>(null)
+  const [requestPrefix] = useState(() => Array.from(crypto.getRandomValues(new Uint8Array(16)), (byte) => byte.toString(16).padStart(2, '0')).join(''))
+  const nextRequest = useRef(0)
+
+  function clearPending() {
+    if (pending.current) clearTimeout(pending.current.timer)
+    pending.current = null
+    setPendingAction(null)
+    setNeedsReconnect(false)
+  }
 
   const handleEvent = useEffectEvent((event: BridgeEvent) => {
     startTransition(() => {
       if (event.type === 'snapshot') {
+        if (!isConfigSnapshot(event.data.config)) {
+          setSnapshotReady(false)
+          setFlash({ kind: 'error', text: t('operationFailed') })
+          return
+        }
         setSnapshot(normalizeSnapshot(event.data))
+        setSnapshotReady(true)
         return
       }
       if (event.type === 'system_state') {
@@ -326,21 +349,44 @@ function App() {
         return
       }
       if (event.type === 'save_result') {
+        if (!matchingMutation(pending.current, event.data)) return
+        const closeEditor = pending.current?.closeEditor
+        clearPending()
+        if (event.data.ok !== true || !isConfigSnapshot(event.data.config)) {
+          setFlash({ kind: 'error', text: t('saveFailed') })
+          return
+        }
         setFlash({ kind: 'success', text: t('saveOk') })
-        setSnapshot((previous) => ({
-          ...previous,
-          config: normalizeConfig(event.data.config),
-        }))
+        setSnapshot((previous) => ({ ...previous, config: normalizeConfig(event.data.config) }))
+        if (closeEditor) setEditor(null)
         return
       }
       if (event.type === 'error') {
-        setFlash({ kind: 'error', text: `${event.data.action}: ${event.data.message}` })
+        if (matchingMutation(pending.current, event.data)) {
+          if (event.data.outcomeUnknown) {
+            setNeedsReconnect(true)
+            setFlash({ kind: 'error', text: t('saveOutcomeUnknown') })
+            return
+          }
+          clearPending()
+          setFlash({ kind: 'error', text: t('saveFailed') })
+        } else if (event.data.requestId === undefined) {
+          // Do not reflect arbitrary plugin/transport errors (paths or tokens).
+          setFlash({ kind: 'error', text: t('operationFailed') })
+        }
       }
     })
   })
 
   const handleStatus = useEffectEvent((nextStatus: BridgeStatus) => {
     setStatus(nextStatus)
+    if (nextStatus !== 'connected') {
+      setSnapshotReady(false)
+      if (pending.current) {
+        clearPending()
+        setFlash({ kind: 'error', text: t('saveOutcomeUnknown') })
+      }
+    }
   })
 
   useEffect(() => {
@@ -351,12 +397,14 @@ function App() {
     return () => {
       unsubscribe()
       unsubscribeStatus()
+      if (pending.current) clearTimeout(pending.current.timer)
+      pending.current = null
       bridge.disconnect()
     }
   }, [])
 
   useEffect(() => {
-    if (!flash) {
+    if (!flash || flash.kind !== 'success') {
       return
     }
     const timer = window.setTimeout(() => setFlash(null), 3200)
@@ -366,8 +414,28 @@ function App() {
   const scopeOptions = flattenScopeOptions(snapshot.devices)
   const runningApps = systemState.process.apps.map((app) => app.name)
   const currentFocus = systemState.focus.current
+  const mutationDisabled = pendingAction !== null || status !== 'connected' || !snapshotReady
+  function sendMutation(action: string, payload: Record<string, unknown>, closeEditor = false) {
+    if (pending.current || status !== 'connected' || !snapshotReady) return
+    const requestId = `${requestPrefix}:${++nextRequest.current}`
+    const timer = setTimeout(() => {
+      if (pending.current?.requestId !== requestId) return
+      setNeedsReconnect(true)
+      setFlash({ kind: 'error', text: t('saveOutcomeUnknown') })
+    }, 30000)
+    pending.current = { action, requestId, closeEditor, timer }
+    setPendingAction(action)
+    setFlash(null)
+    try {
+      if (!bridge.send(action, { ...payload, requestId })) throw new Error('not connected')
+    } catch {
+      clearPending()
+      setFlash({ kind: 'error', text: t('saveFailed') })
+    }
+  }
+
   function updateConfig(nextConfig: typeof snapshot.config) {
-    bridge.send('save_config', { config: nextConfig })
+    sendMutation('save_config', { config: nextConfig }, editor !== null)
   }
 
   function saveRule(rule: RuleConfig) {
@@ -379,14 +447,12 @@ function App() {
       nextConfig.rules.push(rule)
     }
     updateConfig(nextConfig)
-    setEditor(null)
   }
 
   function saveBaseline(actions: ScopeAction[]) {
     const nextConfig = cloneData(snapshot.config)
     nextConfig.baseline.actions = actions
     updateConfig(nextConfig)
-    setEditor(null)
   }
 
   function toggleRule(ruleId: string, enabled: boolean) {
@@ -407,14 +473,15 @@ function App() {
     const nextIds = [...ids]
     const [moved] = nextIds.splice(index, 1)
     nextIds.splice(target, 0, moved)
-    bridge.send('reorder_rules', { ruleIds: nextIds })
+    sendMutation('reorder_rules', { ruleIds: nextIds })
   }
 
   function deleteRule(ruleId: string) {
+    if (pending.current || mutationDisabled) return
     if (!window.confirm(`${t('delete')}?`)) {
       return
     }
-    bridge.send('delete_rule', { ruleId })
+    sendMutation('delete_rule', { ruleId })
   }
 
   return (
@@ -443,7 +510,8 @@ function App() {
             <Box bg="bg.panel" px={4} py={2} rounded="full" borderWidth={1} borderColor="border.subtle">
               <Checkbox.Root
                 checked={snapshot.config.enabled}
-                onCheckedChange={(e) => bridge.send('set_enabled', { enabled: !!e.checked })}
+                disabled={mutationDisabled}
+                onCheckedChange={(e) => sendMutation('set_enabled', { enabled: !!e.checked })}
                 colorPalette="blue"
               >
                 <Checkbox.HiddenInput />
@@ -458,15 +526,20 @@ function App() {
 
         {/* Flash Message */}
         {flash && (
-          <Box p={4} rounded="lg" bg={flash.kind === 'error' ? 'red.subtle' : 'green.subtle'} color={flash.kind === 'error' ? 'red.fg' : 'green.fg'}>
-            <Text fontWeight="medium">{flash.text}</Text>
-          </Box>
+          <Alert.Root status={flash.kind} role={flash.kind === 'error' ? 'alert' : 'status'}
+            bg="bg.panel" color="fg" borderWidth="1px" borderColor="border.subtle">
+            <Alert.Indicator />
+            <Alert.Content><Alert.Title>{flash.text}</Alert.Title></Alert.Content>
+            {needsReconnect ? <Button size="sm" onClick={() => { bridge.disconnect(); bridge.connect() }}>{t('reloadState')}</Button> : null}
+          </Alert.Root>
         )}
+        {pendingAction && !needsReconnect ? <Text role="status">{t('saving')}</Text> : null}
+        <SchedulerFeedback state={schedulerState} />
 
         {/* Stats Row */}
         <SimpleGrid columns={{ base: 1, md: 3 }} gap={6}>
           <StatCard
-            title={t('activeSource')}
+            title={t('selectedSource')}
             value={activeSourceText(schedulerState.activeSource)}
             desc={schedulerState.activeName ?? t('idle')}
           />
@@ -490,12 +563,13 @@ function App() {
               <Flex justify="space-between" align="center">
                 <Heading size="lg">{t('rulesTab')}</Heading>
                 <HStack gap={3}>
-                  <Button size="sm" variant="outline" onClick={() => bridge.send('recompute')}>
+                  <Button size="sm" variant="outline" disabled={mutationDisabled} onClick={() => bridge.send('recompute')}>
                     {t('recompute')}
                   </Button>
                   <Button
                     size="sm"
                     colorPalette="blue"
+                    disabled={mutationDisabled}
                     onClick={() => setEditor({ kind: 'rule', rule: createEmptyRule(), isNew: true })}
                   >
                     {t('addRule')}
@@ -526,7 +600,7 @@ function App() {
                                 )}
                                 {runtimeRule?.active && (
                                   <Badge colorPalette="blue" variant="solid">
-                                    {t('active')}
+                                    {t('selectedPlan')}
                                   </Badge>
                                 )}
                                 {!rule.enabled && (
@@ -538,6 +612,8 @@ function App() {
                             </VStack>
                             <Checkbox.Root
                               checked={rule.enabled}
+                              disabled={mutationDisabled}
+                              aria-label={`${t('enabled')}: ${rule.name || rule.id}`}
                               onCheckedChange={(e) => toggleRule(rule.id, !!e.checked)}
                               colorPalette="blue"
                             >
@@ -549,21 +625,21 @@ function App() {
                         <Separator />
                         <Card.Footer py={2} px={4}>
                           <HStack gap={2} ml="auto">
-                            <Button size="xs" variant="ghost" onClick={() => setEditor({ kind: 'rule', rule, isNew: false })}>
+                            <Button size="xs" variant="ghost" disabled={mutationDisabled} onClick={() => setEditor({ kind: 'rule', rule, isNew: false })}>
                               {t('edit')}
                             </Button>
-                            <Button size="xs" variant="ghost" onClick={() => moveRule(rule.id, -1)} disabled={index === 0}>
+                            <Button size="xs" variant="ghost" onClick={() => moveRule(rule.id, -1)} disabled={mutationDisabled || index === 0}>
                               {t('moveUp')}
                             </Button>
                             <Button
                               size="xs"
                               variant="ghost"
                               onClick={() => moveRule(rule.id, 1)}
-                              disabled={index === snapshot.config.rules.length - 1}
+                              disabled={mutationDisabled || index === snapshot.config.rules.length - 1}
                             >
                               {t('moveDown')}
                             </Button>
-                            <Button size="xs" variant="ghost" colorPalette="red" onClick={() => deleteRule(rule.id)}>
+                            <Button size="xs" variant="ghost" colorPalette="red" disabled={mutationDisabled} onClick={() => deleteRule(rule.id)}>
                               {t('delete')}
                             </Button>
                           </HStack>
@@ -583,7 +659,7 @@ function App() {
                         <Heading size="md">{t('baseline')}</Heading>
                         {schedulerState.activeSource === 'baseline' && (
                           <Badge colorPalette="blue" variant="solid">
-                            {t('active')}
+                            {t('selectedPlan')}
                           </Badge>
                         )}
                       </HStack>
@@ -594,6 +670,7 @@ function App() {
                     <Button
                       size="sm"
                       variant="ghost"
+                      disabled={mutationDisabled}
                       onClick={() => setEditor({ kind: 'baseline', actions: snapshot.config.baseline.actions })}
                     >
                       {t('edit')}
@@ -739,6 +816,10 @@ function App() {
 
       <RuleEditorDrawer
         open={editor !== null}
+        busy={pendingAction !== null}
+        saveDisabled={mutationDisabled}
+        error={flash?.kind === 'error' ? flash.text : undefined}
+        onReload={needsReconnect ? () => { bridge.disconnect(); bridge.connect() } : undefined}
         editor={editor}
         effects={snapshot.effects}
         scopeOptions={scopeOptions}

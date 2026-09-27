@@ -2,7 +2,70 @@
 
 This Windows native extension evaluates application/window and media-session
 conditions, then applies the first matching rule in the configured list. Existing
-rule order, baseline actions, action caching and restore behavior are unchanged.
+rule order and baseline selection are unchanged. Temporary lighting now uses the
+Core-owned automation overlay described below instead of unguarded scope writes.
+
+## Manual control and temporary ownership
+
+The Native extension submits each selected plan with one Host
+`reconcile_automation` request. Core, not the plugin's action cache or value
+comparison, decides which devices it may control. The request carries
+`plan_key`, `actions` and `resume_manual`; plugin identity and runtime generation
+come from the Host and cannot be supplied by the request.
+
+- Automation is a temporary runtime overlay; it does not write its effect,
+  parameters, power, pause or brightness into the user's saved base configuration.
+  Scope inheritance remains part of that base. Finishing a rule, removing its
+  actions, disabling automation or stopping the plugin releases its owned overlay
+  instead of restoring an old copied device configuration.
+- A manual base-configuration change, including a same-value write, invalidates
+  the overlay. Calibration/preview has priority. The resulting device hold is
+  retained by Core across rule changes, ordinary recompute and plugin reload, so
+  automation cannot immediately take back control.
+- To resume after manual intervention, explicitly turn automation off and on in
+  its page. Only a successfully saved `enabled: false` → `enabled: true` edit sends
+  `resume_manual: true`, once. Startup, ordinary saves and the Recompute button do
+  not clear a hold. A still-busy device cannot be taken over by this action.
+- Core checks ownership at device granularity. A base change outside the current
+  action's field can conservatively yield the whole device; preserving manual
+  intent is preferred to guessing which inherited scope is still safe.
+- This version requires a matching Core with the guarded Host method. Missing or
+  malformed Host support is an error, never a fallback to the previous unguarded
+  setters. Core is also responsible for generation-safe cleanup after plugin
+  failure; Native `stop` explicitly releases even after partial startup.
+
+The existing one-second monitor loop reconciles the plan even if application and
+media inputs have not changed. This renews Core's short-lived lease and picks up
+ownership changes; unchanged actions remain a Host-side no-op. A stalled/crashed
+plugin cannot retain an overlay indefinitely. Repeated unchanged failures update
+the scheduler state without creating a new error notification/activity each tick.
+
+`scheduler_state.activeSource`, `activeRuleId` and `activeActions` describe the
+**selected** plan, not proof that every action is applied. `lastSkipped` carries
+Host rows `{ scope, reason }`: `unchanged` means an already-applied plan needs no
+rewrite; reasons such as `manual_override`, `calibration`, `preview` or `busy`
+mean control was yielded. Unknown reasons must remain visible as a generic skip.
+`lastErrors` reports failed actions separately. Hardware acknowledgement is not
+implied by either the plan selection or a Host configuration result.
+
+The main device UI keeps selected/stored values on the base configuration while
+its effective mode, parameters, brightness and power reflect a live overlay.
+Screen/audio source queries use its effective inheritance without rewriting the
+stored selection. If an automated effect differs from the base effect, a manual
+parameter edit or reset first yields control and rejects that request; select the
+desired effect again before retrying. This avoids applying a displayed effect's
+parameters to a different saved effect. It does not implicitly adopt the entire
+automation plan as permanent user settings.
+
+Page mutation requests may include a nonempty `requestId` string up to 128 bytes.
+The matching `save_result` or request `error` echoes that ID; background errors
+have no ID. This lets a page retain its draft and avoid treating another page's
+or a late response as its own completion. A failed configuration save keeps the
+previous in-memory configuration and does not request automatic resume.
+The page and Native plugin must be shipped together: the page matches both action
+and request ID. An older Native response without an ID is not treated as success;
+after a timeout the page reports an unknown result and requires reconnecting for
+an authoritative snapshot instead of blindly retrying, while retaining the draft.
 
 ## Media-session conditions
 
@@ -67,8 +130,9 @@ source ID. Only status and source ID are cached/emitted: title, artist and artwo
 are discarded. The existing snapshot Host includes artwork, so each snapshot query
 requests its minimum size (`max_edge: 1`); it does not add an album-art permission.
 That getter only reads Core's existing memory cache and samples one cached pixel;
-it does not perform thumbnail I/O. Unchanged reconciliations do not recompute or
-repeat actions. Host errors clear the old media state to unknown; later successful
+it does not perform thumbnail I/O. Unchanged media snapshots do not trigger extra
+media-driven recomputation; the one-second ownership heartbeat still reconciles
+the plan without repeating unchanged Host actions. Host errors clear the old media state to unknown; later successful
 reconciliation can recover it. Monitoring stops with the extension.
 
 Core reports `playback_status: "unknown"` if Windows playback information fails,
@@ -107,7 +171,7 @@ conditions and explicit empty groups retain their behavior; genuinely absent
 conditions still use the existing default empty AND. Malformed present roots are
 preserved as an ineligible leaf rather than silently becoming that default.
 
-These are source changes only. Ship the updated page and native plugin together:
+Ship the updated page, native plugin and matching Core together:
 older native builds may still discard kinds they do not recognize. No installed
 DLL or `page/dist` output is replaced by the pure tests below.
 

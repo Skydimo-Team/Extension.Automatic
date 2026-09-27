@@ -183,7 +183,9 @@ unsafe extern "C" fn mock_call_json(
     let failed = method == "get_media_session" && host.fail_media;
     let response = serde_json::to_vec(&if failed {
         json!({ "error": "synthetic media failure" })
-    } else if method == "get_media_session" { host.media_response.clone() } else { Value::Null }).unwrap();
+    } else if method == "get_media_session" { host.media_response.clone() }
+    else if method == "reconcile_automation" { json!({ "applied": [], "skipped": [], "errors": [] }) }
+    else { Value::Null }).unwrap();
     unsafe { *required = response.len(); }
     if out.is_null() || capacity < response.len() {
         return 1;
@@ -204,7 +206,9 @@ fn mock_extension() -> (Box<MockHost>, AutomaticExtension) {
         call_json: Some(mock_call_json),
         ..SkydimoHostApiV1::default()
     } };
-    let extension = AutomaticExtension::new(bridge);
+    let mut extension = AutomaticExtension::new(bridge);
+    // Exercise a running callback generation without spawning an OS monitor.
+    extension.started = true;
     extension.state.lock().unwrap().config = normalize_config(json!({ "rules": [
         { "id": "music", "conditions": playing_group(), "actions": [] },
     ] }));
@@ -225,7 +229,7 @@ fn existing_media_events_update_cache_recompute_and_clear_stale_playing_state() 
         method == "page_emit" && payload["type"] == "system_state"
             && payload["data"]["media"]["playback_status"] == "playing"
     }));
-    assert!(host.calls.iter().all(|(method, _)| method == "page_emit" || method == "get_media_session"));
+    assert!(host.calls.iter().all(|(method, _)| matches!(method.as_str(), "page_emit" | "get_media_session" | "reconcile_automation")));
     host.calls.clear();
     host.media_response = json!({
         "playback_status": "paused", "source_app_id": "test.player",
